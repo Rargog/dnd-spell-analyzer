@@ -49,7 +49,13 @@ else:
 # NUMBER OF SPELLS
 ########################################
 
-num_spells = st.slider("Number of spells",1,MAX_SPELLS,len(spells_data))
+num_spells = st.number_input(
+    "Number of spells",
+    min_value=1,
+    max_value=MAX_SPELLS,
+    value=len(spells_data),
+    step=1
+)
 
 ########################################
 # SPELL INPUTS
@@ -174,3 +180,4 @@ df = pd.DataFrame(table_data)
 st.header("Expected Damage")
 
 st.dataframe(df)
+
