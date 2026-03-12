@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 from scipy.stats import norm
 import json
 import re
+import ast
+import os
 
 MAX_SPELLS = 25
 
@@ -101,22 +103,35 @@ def safe_norm_pdf(x, mu, sigma):
 
 
 def expected_targets(targets_from_csv, aoe_override):
-    """
-    Override only when the packet is clearly multi-target.
-    """
     targets_from_csv = max(int(targets_from_csv), 1)
     if targets_from_csv > 1:
         return int(aoe_override)
     return targets_from_csv
-
 
 #############################################
 # LOAD SPELL DATABASE
 #############################################
 
 @st.cache_data
-def load_spells():
-    df = pd.read_csv("spells.csv")
+def load_spells_from_file(file_source=None):
+    """
+    If file_source is provided, load from uploaded file.
+    Otherwise prefer spells_expanded_features.csv, then spells.csv.
+    """
+    if file_source is not None:
+        df = pd.read_csv(file_source)
+    else:
+        if os.path.exists("spells_expanded_features.csv"):
+            df = pd.read_csv("spells_expanded_features.csv")
+        elif os.path.exists("spells.csv"):
+            df = pd.read_csv("spells.csv")
+        else:
+            raise FileNotFoundError(
+                "Could not find spells_expanded_features.csv or spells.csv in the app directory."
+            )
+
+    # Clean column names in case of hidden spaces/BOM
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 
     required_cols = ["name", "base_level", "max_rounds", "notes"]
     for col in required_cols:
@@ -137,15 +152,12 @@ def load_spells():
     for slot in range(1, 10):
         for phase in ["initial", "repeat"]:
             col = f"slot{slot}_{phase}"
-            df[col] = df[col].fillna("[]").astype(str)
+            df[col] = df[col].fillna("[]").astype(str).str.strip()
 
     df = df[df["name"] != ""].copy()
     df = df.drop_duplicates(subset="name", keep="first").reset_index(drop=True)
 
     return df
-
-
-spell_db = load_spells()
 
 #############################################
 # JSON PACKET PARSING
@@ -154,19 +166,25 @@ spell_db = load_spells()
 def parse_packet_list(cell_value):
     """
     Parse a JSON array of packet dicts from a CSV cell.
-    Returns a list of normalized packet dicts.
+    Tries json.loads first, then ast.literal_eval as a fallback.
     """
     if pd.isna(cell_value):
         return []
 
     text = str(cell_value).strip()
-    if text == "" or text.lower() == "nan":
+
+    if text == "" or text.lower() == "nan" or text == "[]":
         return []
+
+    data = None
 
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
-        return []
+    except Exception:
+        try:
+            data = ast.literal_eval(text)
+        except Exception:
+            return []
 
     if not isinstance(data, list):
         return []
@@ -193,10 +211,6 @@ def parse_packet_list(cell_value):
 
 
 def get_spell_packets(spell_row, slot_level, phase):
-    """
-    phase = 'initial' or 'repeat'
-    Returns parsed packet list for the chosen spell slot.
-    """
     slot_level = int(slot_level)
     if slot_level < 1 or slot_level > 9:
         return []
@@ -207,23 +221,17 @@ def get_spell_packets(spell_row, slot_level, phase):
 
     return parse_packet_list(spell_row[col])
 
-
 #############################################
 # DAMAGE STAT FUNCTIONS
 #############################################
 
 def base_damage_stats(dice, sides, flat=0):
-    """
-    Returns mean and variance for dice*sides + flat.
-    """
     dice = int(dice)
     sides = int(sides)
     flat = float(flat)
 
     if dice <= 0 or sides <= 0:
-        mu = flat
-        var = 0.0
-        return mu, var
+        return flat, 0.0
 
     mu = dice * (sides + 1) / 2 + flat
     var_single_die = (sides**2 - 1) / 12
@@ -232,9 +240,6 @@ def base_damage_stats(dice, sides, flat=0):
 
 
 def packet_single_instance_stats(packet, DC, monster_saves, spell_attack_bonus, target_ac, attack_roll_mode):
-    """
-    Returns mean, variance, and resolution label for ONE instance against ONE target.
-    """
     mu_hit, var_hit = base_damage_stats(packet["dice"], packet["sides"], packet["flat"])
 
     if mu_hit == 0 and var_hit == 0:
@@ -262,7 +267,7 @@ def packet_single_instance_stats(packet, DC, monster_saves, spell_attack_bonus, 
         fail_prob = (DC - save_mod - 1) / 20
         fail_prob = max(0.0, min(1.0, fail_prob))
 
-        # Model save spells as full damage on fail, half on success
+        # Approximation: full damage on fail, half on success
         mu_save = mu_hit / 2
         var_save = var_hit / 4
 
@@ -278,10 +283,6 @@ def packet_single_instance_stats(packet, DC, monster_saves, spell_attack_bonus, 
 
 
 def aggregate_packet_group_stats(packet_list, DC, monster_saves, spell_attack_bonus, target_ac, attack_roll_mode, aoe_override):
-    """
-    Aggregates mean/variance across all packets in one phase.
-    Assumes independence between packets/instances/targets.
-    """
     total_mu = 0.0
     total_var = 0.0
     breakdown_rows = []
@@ -329,6 +330,19 @@ def make_distribution(mu, var):
     pdf = safe_norm_pdf(x, mu, sigma)
     return x, pdf
 
+#############################################
+# SIDEBAR: FILE INPUT
+#############################################
+
+st.sidebar.header("Spell CSV")
+
+uploaded_csv = st.sidebar.file_uploader("Upload expanded spell CSV", type="csv")
+
+try:
+    spell_db = load_spells_from_file(uploaded_csv)
+except Exception as e:
+    st.error(f"Failed to load spell CSV: {e}")
+    st.stop()
 
 #############################################
 # PAGE HEADER
@@ -483,6 +497,9 @@ for entry in spell_entries:
     slot = int(entry["slot"])
 
     initial_packets = get_spell_packets(spell, slot, "initial")
+
+    if len(initial_packets) == 0:
+        st.warning(f"{entry['name']} at slot {slot} has no parsed initial packets.")
 
     mu_initial, var_initial, breakdown_initial = aggregate_packet_group_stats(
         packet_list=initial_packets,
@@ -659,3 +676,13 @@ for entry in spell_entries:
             st.dataframe(pd.DataFrame(breakdown_repeat), use_container_width=True)
         else:
             st.write("No repeat damage packets.")
+
+#############################################
+# DEBUG PREVIEW
+#############################################
+
+with st.expander("Debug: Loaded CSV preview", expanded=False):
+    st.write("Loaded columns:")
+    st.write(list(spell_db.columns))
+    st.write("First few rows:")
+    st.dataframe(spell_db.head(), use_container_width=True)
