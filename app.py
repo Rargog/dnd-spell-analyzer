@@ -8,48 +8,14 @@ import json
 MAX_SPELLS = 25
 
 #############################################
-# LOAD DATABASES
+# LOAD SPELL DATABASE
 #############################################
 
 @st.cache_data
 def load_spells():
     return pd.read_csv("spells.csv")
 
-@st.cache_data
-def load_monsters():
-    return pd.read_csv("monsters.csv")
-
 spell_db = load_spells()
-monster_db = load_monsters()
-
-#############################################
-# COMPUTE RESISTANCE STATISTICS
-#############################################
-
-def compute_resistance_rates(monster_df):
-
-    damage_types = [
-        "fire","cold","lightning","acid","poison",
-        "necrotic","radiant","thunder","psychic","force"
-    ]
-
-    results = {}
-
-    total = len(monster_df)
-
-    for dmg in damage_types:
-
-        resistant = monster_df["resistances"].fillna("").str.contains(dmg).sum()
-        immune = monster_df["immunities"].fillna("").str.contains(dmg).sum()
-
-        results[dmg] = {
-            "resistant": resistant/total,
-            "immune": immune/total
-        }
-
-    return results
-
-RESISTANCE_STATS = compute_resistance_rates(monster_db)
 
 #############################################
 # PAGE HEADER
@@ -58,7 +24,7 @@ RESISTANCE_STATS = compute_resistance_rates(monster_db)
 st.title("D&D 5e Spell Damage Analyzer")
 
 st.write(
-"Compare damage distributions using PHB spell mechanics and Monster Manual resistances."
+"Compare damage distributions for D&D 5e spells including multi-ray and multi-target mechanics."
 )
 
 #############################################
@@ -67,11 +33,11 @@ st.write(
 
 st.sidebar.header("Global Settings")
 
-DC = st.sidebar.number_input("Spell Save DC", min_value=1, max_value=30, value=15)
-
-use_resistance = st.sidebar.checkbox(
-    "Account for Monster Manual resistances",
-    value=False
+DC = st.sidebar.number_input(
+    "Spell Save DC",
+    min_value=1,
+    max_value=30,
+    value=15
 )
 
 #############################################
@@ -122,7 +88,7 @@ num_spells = int(st.number_input(
 ))
 
 #############################################
-# SPELL INPUT SECTION
+# SPELL INPUT
 #############################################
 
 st.header("Spell Selection")
@@ -155,18 +121,22 @@ for i in range(num_spells):
         })
 
 #############################################
-# SPELL SCALING FUNCTION
+# SPELL SCALING
 #############################################
 
-def calculate_scaled_dice(spell, slot):
+def calculate_scaled_values(spell, slot):
 
     n = spell["base_dice"]
     s = spell["dice_sides"]
+    rays = spell["rays"]
 
     if slot > spell["base_level"]:
         n += (slot - spell["base_level"]) * spell["scaling_dice"]
+        rays += (slot - spell["base_level"]) * spell["scaling_rays"]
 
-    return n, s
+    targets = spell["targets"]
+
+    return n, s, rays, targets
 
 #############################################
 # DAMAGE DISTRIBUTION MODEL
@@ -194,7 +164,7 @@ def spell_distribution(n, s, DC, save_mod):
     return x, pdf, mu
 
 #############################################
-# RESULTS
+# DAMAGE RESULTS
 #############################################
 
 st.header("Damage Distributions")
@@ -207,39 +177,34 @@ for entry in spell_entries:
 
     spell = spell_db[spell_db["name"] == entry["name"]].iloc[0]
 
-    n, s = calculate_scaled_dice(spell, entry["slot"])
+    n, s, rays, targets = calculate_scaled_values(spell, entry["slot"])
 
-    save_mod = monster_saves[spell["save"]]
+    save_mod = monster_saves.get(spell["save"], 0)
 
-    x, pdf, mu = spell_distribution(
+    x, pdf, mu_single = spell_distribution(
         n,
         s,
         DC,
         save_mod
     )
 
-    dmg_type = spell["damage_type"]
+    mu_total = mu_single * rays * targets
 
-    if use_resistance:
-
-        stats = RESISTANCE_STATS[dmg_type]
-
-        resist = stats["resistant"]
-        immune = stats["immune"]
-
-        normal = 1 - resist - immune
-
-        mu = normal*mu + resist*(mu/2)
-
-    ax.plot(x, pdf, label=f"{entry['name']} (Lv {entry['slot']})")
+    ax.plot(
+        x,
+        pdf,
+        label=f"{entry['name']} (Lv {entry['slot']})"
+    )
 
     table_data.append({
         "Spell": entry["name"],
         "Slot Level": entry["slot"],
         "Dice": f"{n}d{s}",
+        "Rays": rays,
+        "Targets": targets,
         "Save": spell["save"],
-        "Damage Type": dmg_type,
-        "Expected Damage": round(mu,2)
+        "Damage Type": spell["damage_type"],
+        "Expected Damage": round(mu_total,2)
     })
 
 ax.set_xlabel("Damage")
@@ -259,23 +224,3 @@ df = pd.DataFrame(table_data)
 st.header("Expected Damage Table")
 
 st.dataframe(df)
-
-#############################################
-# RESISTANCE STATISTICS VIEW
-#############################################
-
-if use_resistance:
-
-    st.header("Monster Manual Resistance Statistics")
-
-    res_table = []
-
-    for dmg in RESISTANCE_STATS:
-
-        res_table.append({
-            "Damage Type": dmg,
-            "Resistant %": round(RESISTANCE_STATS[dmg]["resistant"]*100,2),
-            "Immune %": round(RESISTANCE_STATS[dmg]["immune"]*100,2)
-        })
-
-    st.dataframe(pd.DataFrame(res_table))
