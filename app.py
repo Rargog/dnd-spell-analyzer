@@ -3,83 +3,174 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
 import pandas as pd
+import json
+
+MAX_SPELLS = 25
 
 st.title("D&D Spell Damage Analyzer")
 
-st.write("Compare expected damage distributions for multiple spells.")
+st.write("Compare damage distributions for multiple spells.")
 
-# Sidebar inputs
-st.sidebar.header("Global Settings")
+########################################
+# GLOBAL SETTINGS
+########################################
+
+st.sidebar.header("Spell Save DC")
 
 DC = st.sidebar.number_input("Spell Save DC", value=15)
-save_mod = st.sidebar.number_input("Enemy Save Modifier", value=2)
 
-num_spells = st.sidebar.slider("Number of spells to compare", 1, 5, 2)
+########################################
+# MONSTER SAVE MODIFIERS
+########################################
+
+st.sidebar.header("Monster Save Modifiers")
+
+monster_saves = {
+    "STR": st.sidebar.number_input("STR Save", value=0),
+    "DEX": st.sidebar.number_input("DEX Save", value=2),
+    "CON": st.sidebar.number_input("CON Save", value=3),
+    "INT": st.sidebar.number_input("INT Save", value=0),
+    "WIS": st.sidebar.number_input("WIS Save", value=1),
+    "CHA": st.sidebar.number_input("CHA Save", value=0),
+}
+
+########################################
+# LOAD SAVED SPELLS
+########################################
+
+uploaded_file = st.sidebar.file_uploader("Load Spell List", type="json")
+
+if uploaded_file:
+    spells_data = json.load(uploaded_file)
+else:
+    spells_data = [{"name":"Fireball","n":8,"s":6,"save":"DEX"}]
+
+########################################
+# NUMBER OF SPELLS
+########################################
+
+num_spells = st.slider("Number of spells",1,MAX_SPELLS,len(spells_data))
+
+########################################
+# SPELL INPUTS
+########################################
 
 spells = []
 
-st.header("Spell Inputs")
+st.header("Spell Definitions")
 
 for i in range(num_spells):
 
-    st.subheader(f"Spell {i+1}")
+    if i < len(spells_data):
+        default = spells_data[i]
+    else:
+        default = {"name":f"Spell {i+1}","n":8,"s":6,"save":"DEX"}
 
-    col1, col2, col3 = st.columns(3)
+    with st.expander(f"Spell {i+1}", expanded=False):
 
-    name = col1.text_input(f"Spell name {i}", f"Spell {i+1}")
-    n = col2.number_input(f"Number of dice {i}", 1, 20, 8)
-    s = col3.number_input(f"Sides per die {i}", 2, 20, 6)
+        col1,col2,col3,col4 = st.columns(4)
 
-    spells.append((name, n, s))
+        name = col1.text_input("Name", default["name"], key=f"name{i}")
+        n = col2.number_input("Dice",1,50,default["n"], key=f"n{i}")
+        s = col3.number_input("Sides",2,20,default["s"], key=f"s{i}")
+        save = col4.selectbox(
+            "Save Stat",
+            ["STR","DEX","CON","INT","WIS","CHA"],
+            index=["STR","DEX","CON","INT","WIS","CHA"].index(default["save"]),
+            key=f"save{i}"
+        )
 
-def spell_distribution(n, s, DC, save_mod):
+        spells.append({
+            "name":name,
+            "n":n,
+            "s":s,
+            "save":save
+        })
 
-    mu_hit = n * (s + 1) / 2
+########################################
+# SAVE SPELL LIST
+########################################
 
-    var = n * ((s + 1) * (2*s + 1) / 6) - ((s+1)/2)**2
+st.sidebar.header("Save Spell List")
+
+json_data = json.dumps(spells,indent=2)
+
+st.sidebar.download_button(
+    "Download Spell List",
+    json_data,
+    file_name="spells.json"
+)
+
+########################################
+# DAMAGE MODEL
+########################################
+
+def spell_distribution(n,s,DC,save_mod):
+
+    mu_hit = n*(s+1)/2
+
+    var = n*((s+1)*(2*s+1)/6) - ((s+1)/2)**2
     sigma_hit = np.sqrt(var)
 
-    mu_save = mu_hit / 2
-    sigma_save = sigma_hit / 2
+    mu_save = mu_hit/2
+    sigma_save = sigma_hit/2
 
-    h = (DC - save_mod - 1) / 20
-    h = max(0, min(1, h))
+    h = (DC - save_mod - 1)/20
+    h = max(0,min(1,h))
 
-    mu_total = h * mu_hit + (1-h) * mu_save
+    mu_total = h*mu_hit + (1-h)*mu_save
 
-    x = np.linspace(0, mu_hit*2, 500)
+    x = np.linspace(0,mu_hit*2,500)
 
-    pdf = h*norm.pdf(x, mu_hit, sigma_hit) + (1-h)*norm.pdf(x, mu_save, sigma_save)
+    pdf = h*norm.pdf(x,mu_hit,sigma_hit) + (1-h)*norm.pdf(x,mu_save,sigma_save)
 
-    return x, pdf, mu_total
+    return x,pdf,mu_total
 
-st.header("Results")
+########################################
+# RESULTS
+########################################
 
-fig, ax = plt.subplots()
+st.header("Damage Distributions")
 
-data = []
+fig,ax = plt.subplots()
 
-for name, n, s in spells:
+table_data = []
 
-    x, pdf, mu = spell_distribution(n, s, DC, save_mod)
+for spell in spells:
 
-    ax.plot(x, pdf, label=name)
+    save_mod = monster_saves[spell["save"]]
 
-    data.append({
-        "Spell": name,
-        "Dice": f"{n}d{s}",
-        "Mean Damage": round(mu,2)
+    x,pdf,mu = spell_distribution(
+        spell["n"],
+        spell["s"],
+        DC,
+        save_mod
+    )
+
+    ax.plot(x,pdf,label=spell["name"])
+
+    table_data.append({
+        "Spell":spell["name"],
+        "Dice":f'{spell["n"]}d{spell["s"]}',
+        "Save":spell["save"],
+        "Enemy Save Mod":save_mod,
+        "Expected Damage":round(mu,2)
     })
 
 ax.set_xlabel("Damage")
 ax.set_ylabel("Probability Density")
-ax.set_title("Damage Distribution")
-ax.legend()
+ax.set_title("Spell Damage Distributions")
+
+ax.legend(fontsize=8)
 
 st.pyplot(fig)
 
-df = pd.DataFrame(data)
+########################################
+# TABLE
+########################################
 
-st.subheader("Expected Damage Table")
+df = pd.DataFrame(table_data)
+
+st.header("Expected Damage")
 
 st.dataframe(df)
