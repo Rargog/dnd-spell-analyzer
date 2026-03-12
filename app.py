@@ -100,6 +100,16 @@ def safe_norm_pdf(x, mu, sigma):
     return norm.pdf(x, mu, sigma)
 
 
+def expected_targets(targets_from_csv, aoe_override):
+    """
+    Override only when the packet is clearly multi-target.
+    """
+    targets_from_csv = max(int(targets_from_csv), 1)
+    if targets_from_csv > 1:
+        return int(aoe_override)
+    return targets_from_csv
+
+
 #############################################
 # LOAD SPELL DATABASE
 #############################################
@@ -108,78 +118,26 @@ def safe_norm_pdf(x, mu, sigma):
 def load_spells():
     df = pd.read_csv("spells.csv")
 
-    required_defaults = {
-        "name": "",
-        "base_level": 1,
-        "base_dice": 0,
-        "dice_sides": 0,
-        "scaling_dice": 0,
-        "save": "none",
-        "damage_type": "none",
-        "rays": 1,
-        "scaling_rays": 0,
-        "targets": 1,
-        "attack_type": "save",
-        "repeat_base_dice": 0,
-        "repeat_dice_sides": 0,
-        "repeat_scaling_dice": 0,
-        "repeat_save": "none",
-        "repeat_attack_type": "none",
-        "repeat_rays": 1,
-        "repeat_scaling_rays": 0,
-        "repeat_targets": 1,
-        "max_rounds": 1,
-    }
-
-    for col, default_value in required_defaults.items():
+    required_cols = ["name", "base_level", "max_rounds", "notes"]
+    for col in required_cols:
         if col not in df.columns:
-            df[col] = default_value
+            df[col] = ""
 
-    text_cols = ["name", "damage_type"]
-    for col in text_cols:
-        df[col] = df[col].fillna("").astype(str).str.strip()
+    for slot in range(1, 10):
+        for phase in ["initial", "repeat"]:
+            col = f"slot{slot}_{phase}"
+            if col not in df.columns:
+                df[col] = "[]"
 
-    df["damage_type"] = df["damage_type"].str.lower()
-    df["save"] = df["save"].apply(normalize_save)
-    df["repeat_save"] = df["repeat_save"].apply(normalize_save)
-    df["attack_type"] = df["attack_type"].apply(lambda x: normalize_attack_type(x, default="save"))
-    df["repeat_attack_type"] = df["repeat_attack_type"].apply(lambda x: normalize_attack_type(x, default="none"))
+    df["name"] = df["name"].fillna("").astype(str).str.strip()
+    df["base_level"] = df["base_level"].apply(lambda x: extract_first_int(x, 1)).clip(lower=1, upper=9)
+    df["max_rounds"] = df["max_rounds"].apply(lambda x: extract_first_int(x, 1)).clip(lower=1)
+    df["notes"] = df["notes"].fillna("").astype(str).str.strip()
 
-    numeric_cols = [
-        "base_level",
-        "base_dice",
-        "dice_sides",
-        "scaling_dice",
-        "rays",
-        "scaling_rays",
-        "targets",
-        "repeat_base_dice",
-        "repeat_dice_sides",
-        "repeat_scaling_dice",
-        "repeat_rays",
-        "repeat_scaling_rays",
-        "repeat_targets",
-        "max_rounds",
-    ]
-
-    for col in numeric_cols:
-        df[col] = df[col].apply(extract_first_int)
-
-    df["base_level"] = df["base_level"].clip(lower=1, upper=9)
-    df["base_dice"] = df["base_dice"].clip(lower=0)
-    df["dice_sides"] = df["dice_sides"].clip(lower=0)
-    df["scaling_dice"] = df["scaling_dice"].clip(lower=0)
-    df["rays"] = df["rays"].clip(lower=1)
-    df["scaling_rays"] = df["scaling_rays"].clip(lower=0)
-    df["targets"] = df["targets"].clip(lower=1)
-
-    df["repeat_base_dice"] = df["repeat_base_dice"].clip(lower=0)
-    df["repeat_dice_sides"] = df["repeat_dice_sides"].clip(lower=0)
-    df["repeat_scaling_dice"] = df["repeat_scaling_dice"].clip(lower=0)
-    df["repeat_rays"] = df["repeat_rays"].clip(lower=1)
-    df["repeat_scaling_rays"] = df["repeat_scaling_rays"].clip(lower=0)
-    df["repeat_targets"] = df["repeat_targets"].clip(lower=1)
-    df["max_rounds"] = df["max_rounds"].clip(lower=1)
+    for slot in range(1, 10):
+        for phase in ["initial", "repeat"]:
+            col = f"slot{slot}_{phase}"
+            df[col] = df[col].fillna("[]").astype(str)
 
     df = df[df["name"] != ""].copy()
     df = df.drop_duplicates(subset="name", keep="first").reset_index(drop=True)
@@ -190,13 +148,196 @@ def load_spells():
 spell_db = load_spells()
 
 #############################################
+# JSON PACKET PARSING
+#############################################
+
+def parse_packet_list(cell_value):
+    """
+    Parse a JSON array of packet dicts from a CSV cell.
+    Returns a list of normalized packet dicts.
+    """
+    if pd.isna(cell_value):
+        return []
+
+    text = str(cell_value).strip()
+    if text == "" or text.lower() == "nan":
+        return []
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    packets = []
+    for raw in data:
+        if not isinstance(raw, dict):
+            continue
+
+        packet = {
+            "dice": extract_first_int(raw.get("dice", 0), 0),
+            "sides": extract_first_int(raw.get("sides", 0), 0),
+            "flat": extract_first_int(raw.get("flat", 0), 0),
+            "attack_type": normalize_attack_type(raw.get("attack_type", "save"), default="save"),
+            "save": normalize_save(raw.get("save", "none")),
+            "damage_type": str(raw.get("damage_type", "none")).strip().lower(),
+            "instances": max(extract_first_int(raw.get("instances", 1), 1), 1),
+            "targets": max(extract_first_int(raw.get("targets", 1), 1), 1),
+            "notes": str(raw.get("notes", "")).strip(),
+        }
+        packets.append(packet)
+
+    return packets
+
+
+def get_spell_packets(spell_row, slot_level, phase):
+    """
+    phase = 'initial' or 'repeat'
+    Returns parsed packet list for the chosen spell slot.
+    """
+    slot_level = int(slot_level)
+    if slot_level < 1 or slot_level > 9:
+        return []
+
+    col = f"slot{slot_level}_{phase}"
+    if col not in spell_row.index:
+        return []
+
+    return parse_packet_list(spell_row[col])
+
+
+#############################################
+# DAMAGE STAT FUNCTIONS
+#############################################
+
+def base_damage_stats(dice, sides, flat=0):
+    """
+    Returns mean and variance for dice*sides + flat.
+    """
+    dice = int(dice)
+    sides = int(sides)
+    flat = float(flat)
+
+    if dice <= 0 or sides <= 0:
+        mu = flat
+        var = 0.0
+        return mu, var
+
+    mu = dice * (sides + 1) / 2 + flat
+    var_single_die = (sides**2 - 1) / 12
+    var = dice * var_single_die
+    return float(mu), float(var)
+
+
+def packet_single_instance_stats(packet, DC, monster_saves, spell_attack_bonus, target_ac, attack_roll_mode):
+    """
+    Returns mean, variance, and resolution label for ONE instance against ONE target.
+    """
+    mu_hit, var_hit = base_damage_stats(packet["dice"], packet["sides"], packet["flat"])
+
+    if mu_hit == 0 and var_hit == 0:
+        return 0.0, 0.0, "No Damage"
+
+    attack_type = packet["attack_type"]
+
+    if attack_type == "attack":
+        hit_prob = attack_hit_probability(spell_attack_bonus, target_ac, attack_roll_mode)
+        e2_hit = var_hit + mu_hit**2
+        mu = hit_prob * mu_hit
+        e2 = hit_prob * e2_hit
+        var = max(e2 - mu**2, 0.0)
+        resolution = f"Attack ({attack_roll_mode})"
+
+    elif attack_type == "none":
+        mu = mu_hit
+        var = var_hit
+        resolution = "Automatic"
+
+    else:
+        save_type = packet["save"]
+        save_mod = monster_saves.get(save_type, 0)
+
+        fail_prob = (DC - save_mod - 1) / 20
+        fail_prob = max(0.0, min(1.0, fail_prob))
+
+        # Model save spells as full damage on fail, half on success
+        mu_save = mu_hit / 2
+        var_save = var_hit / 4
+
+        e2_hit = var_hit + mu_hit**2
+        e2_save = var_save + mu_save**2
+
+        mu = fail_prob * mu_hit + (1 - fail_prob) * mu_save
+        e2 = fail_prob * e2_hit + (1 - fail_prob) * e2_save
+        var = max(e2 - mu**2, 0.0)
+        resolution = f"{save_type} Save"
+
+    return mu, var, resolution
+
+
+def aggregate_packet_group_stats(packet_list, DC, monster_saves, spell_attack_bonus, target_ac, attack_roll_mode, aoe_override):
+    """
+    Aggregates mean/variance across all packets in one phase.
+    Assumes independence between packets/instances/targets.
+    """
+    total_mu = 0.0
+    total_var = 0.0
+    breakdown_rows = []
+
+    for packet in packet_list:
+        mu_one, var_one, resolution = packet_single_instance_stats(
+            packet=packet,
+            DC=DC,
+            monster_saves=monster_saves,
+            spell_attack_bonus=spell_attack_bonus,
+            target_ac=target_ac,
+            attack_roll_mode=attack_roll_mode,
+        )
+
+        targets = expected_targets(packet["targets"], aoe_override)
+        instances = int(packet["instances"])
+        total_copies = instances * targets
+
+        packet_mu = mu_one * total_copies
+        packet_var = var_one * total_copies
+
+        total_mu += packet_mu
+        total_var += packet_var
+
+        packet_label = f"{packet['dice']}d{packet['sides']}"
+        if packet["flat"] != 0:
+            packet_label += f" + {packet['flat']}"
+
+        breakdown_rows.append({
+            "Damage Type": packet["damage_type"],
+            "Packet": packet_label,
+            "Instances": instances,
+            "Targets": targets,
+            "Resolution": resolution,
+            "Expected Damage": round(packet_mu, 2),
+        })
+
+    return total_mu, total_var, breakdown_rows
+
+
+def make_distribution(mu, var):
+    sigma = max(np.sqrt(max(var, 0.0)), 1e-9)
+    xmax = max(mu + 4 * sigma, 1)
+    x = np.linspace(0, xmax, 700)
+    pdf = safe_norm_pdf(x, mu, sigma)
+    return x, pdf
+
+
+#############################################
 # PAGE HEADER
 #############################################
 
 st.title("D&D 5e Spell Damage Analyzer")
 
 st.write(
-    "Compare D&D 5e spell damage including saves, attack rolls, multi-ray spells, AoE targets, repeat damage, and multiple rounds."
+    "Compare D&D 5e spell damage using slot-specific damage packets, attack rolls, saves, repeat damage, and multi-round effects."
 )
 
 #############################################
@@ -329,227 +470,75 @@ for i in range(num_spells):
         })
 
 #############################################
-# SPELL SCALING
-#############################################
-
-def calculate_scaled_component(spell, slot, prefix=""):
-    if prefix == "":
-        base_dice = int(spell["base_dice"])
-        dice_sides = int(spell["dice_sides"])
-        scaling_dice = int(spell["scaling_dice"])
-        rays = int(spell["rays"])
-        scaling_rays = int(spell["scaling_rays"])
-        targets = int(spell["targets"])
-        save_type = spell["save"]
-        attack_type = spell["attack_type"]
-    else:
-        base_dice = int(spell[f"{prefix}base_dice"])
-        dice_sides = int(spell[f"{prefix}dice_sides"])
-        scaling_dice = int(spell[f"{prefix}scaling_dice"])
-        rays = int(spell[f"{prefix}rays"])
-        scaling_rays = int(spell[f"{prefix}scaling_rays"])
-        targets = int(spell[f"{prefix}targets"])
-        save_type = spell[f"{prefix}save"]
-        attack_type = spell[f"{prefix}attack_type"]
-
-    base_level = int(spell["base_level"])
-
-    if slot > base_level:
-        level_diff = slot - base_level
-        base_dice += level_diff * scaling_dice
-        rays += level_diff * scaling_rays
-
-    rays = max(rays, 1)
-    targets = max(targets, 1)
-
-    return {
-        "dice": int(base_dice),
-        "sides": int(dice_sides),
-        "rays": int(rays),
-        "targets": int(targets),
-        "save": save_type,
-        "attack_type": attack_type,
-    }
-
-#############################################
-# DAMAGE STAT FUNCTIONS
-#############################################
-
-def base_damage_stats(n, s):
-    if n <= 0 or s <= 0:
-        return 0.0, 0.0
-
-    mu = n * (s + 1) / 2
-    var_single_die = (s**2 - 1) / 12
-    var = n * var_single_die
-    return float(mu), float(var)
-
-
-def single_instance_stats_save(n, s, DC, save_mod):
-    mu_hit, var_hit = base_damage_stats(n, s)
-
-    if mu_hit == 0:
-        return 0.0, 0.0
-
-    fail_prob = (DC - save_mod - 1) / 20
-    fail_prob = max(0.0, min(1.0, fail_prob))
-
-    mu_save = mu_hit / 2
-    var_save = var_hit / 4
-
-    e2_hit = var_hit + mu_hit**2
-    e2_save = var_save + mu_save**2
-
-    mu = fail_prob * mu_hit + (1 - fail_prob) * mu_save
-    e2 = fail_prob * e2_hit + (1 - fail_prob) * e2_save
-    var = max(e2 - mu**2, 0.0)
-
-    return mu, var
-
-
-def single_instance_stats_attack(n, s, attack_bonus, target_ac, roll_mode):
-    mu_hit, var_hit = base_damage_stats(n, s)
-
-    if mu_hit == 0:
-        return 0.0, 0.0
-
-    hit_prob = attack_hit_probability(attack_bonus, target_ac, roll_mode)
-
-    e2_hit = var_hit + mu_hit**2
-    mu = hit_prob * mu_hit
-    e2 = hit_prob * e2_hit
-    var = max(e2 - mu**2, 0.0)
-
-    return mu, var
-
-
-def single_instance_stats_auto(n, s):
-    mu, var = base_damage_stats(n, s)
-    return mu, var
-
-
-def component_stats(component, DC, monster_saves, attack_bonus, target_ac, roll_mode):
-    n = component["dice"]
-    s = component["sides"]
-    attack_type = component["attack_type"]
-    save_type = component["save"]
-
-    if attack_type == "attack":
-        mu_single, var_single = single_instance_stats_attack(
-            n=n,
-            s=s,
-            attack_bonus=attack_bonus,
-            target_ac=target_ac,
-            roll_mode=roll_mode
-        )
-        resolution = f"Attack ({roll_mode})"
-    elif attack_type == "none":
-        mu_single, var_single = single_instance_stats_auto(n=n, s=s)
-        resolution = "Automatic"
-    else:
-        save_mod = monster_saves.get(save_type, 0)
-        mu_single, var_single = single_instance_stats_save(
-            n=n,
-            s=s,
-            DC=DC,
-            save_mod=save_mod
-        )
-        resolution = f"{save_type} Save"
-
-    return mu_single, var_single, resolution
-
-
-def apply_target_override(targets_from_csv, aoe_override):
-    if int(targets_from_csv) > 1:
-        return int(aoe_override)
-    return int(targets_from_csv)
-
-
-def make_distribution(mu, var):
-    sigma = max(np.sqrt(max(var, 0.0)), 1e-9)
-    xmax = max(mu + 4 * sigma, 1)
-    x = np.linspace(0, xmax, 700)
-    pdf = safe_norm_pdf(x, mu, sigma)
-    return x, pdf
-
-
-#############################################
-# RESULTS: SINGLE-ROUND / INITIAL DAMAGE
+# RESULTS: INITIAL CAST
 #############################################
 
 st.header("Initial Cast Damage Distributions")
 
 fig_initial, ax_initial = plt.subplots()
-table_data = []
+summary_rows = []
 
 for entry in spell_entries:
     spell = spell_db[spell_db["name"] == entry["name"]].iloc[0]
+    slot = int(entry["slot"])
 
-    initial = calculate_scaled_component(spell, entry["slot"], prefix="")
-    init_targets = apply_target_override(initial["targets"], default_aoe_targets)
+    initial_packets = get_spell_packets(spell, slot, "initial")
 
-    mu_single, var_single, init_resolution = component_stats(
-        component=initial,
+    mu_initial, var_initial, breakdown_initial = aggregate_packet_group_stats(
+        packet_list=initial_packets,
         DC=DC,
         monster_saves=monster_saves,
-        attack_bonus=spell_attack_bonus,
+        spell_attack_bonus=spell_attack_bonus,
         target_ac=target_ac,
-        roll_mode=attack_roll_mode
+        attack_roll_mode=attack_roll_mode,
+        aoe_override=default_aoe_targets
     )
 
-    init_instances = int(initial["rays"]) * int(init_targets)
-    mu_initial_total = mu_single * init_instances
-    var_initial_total = var_single * init_instances
-
-    x_init, pdf_init = make_distribution(mu_initial_total, var_initial_total)
+    x_init, pdf_init = make_distribution(mu_initial, var_initial)
 
     ax_initial.plot(
         x_init,
         pdf_init,
-        label=f"{entry['name']} (Lv {entry['slot']})"
+        label=f"{entry['name']} (Lv {slot})"
     )
 
-    repeat = calculate_scaled_component(spell, entry["slot"], prefix="repeat_")
-    repeat_targets = apply_target_override(repeat["targets"], default_aoe_targets)
-
-    repeat_mu_single, repeat_var_single, repeat_resolution = component_stats(
-        component=repeat,
-        DC=DC,
-        monster_saves=monster_saves,
-        attack_bonus=spell_attack_bonus,
-        target_ac=target_ac,
-        roll_mode=attack_roll_mode
-    )
-
-    repeat_instances_per_round = int(repeat["rays"]) * int(repeat_targets)
-
+    repeat_packets = get_spell_packets(spell, slot, "repeat")
     active_rounds = min(int(combat_rounds), int(spell["max_rounds"]))
     repeat_rounds = max(active_rounds - 1, 0)
 
-    mu_repeat_total = repeat_mu_single * repeat_instances_per_round * repeat_rounds
-    var_repeat_total = repeat_var_single * repeat_instances_per_round * repeat_rounds
+    mu_repeat_one_round, var_repeat_one_round, breakdown_repeat = aggregate_packet_group_stats(
+        packet_list=repeat_packets,
+        DC=DC,
+        monster_saves=monster_saves,
+        spell_attack_bonus=spell_attack_bonus,
+        target_ac=target_ac,
+        attack_roll_mode=attack_roll_mode,
+        aoe_override=default_aoe_targets
+    )
 
-    mu_full_spell = mu_initial_total + mu_repeat_total
-    var_full_spell = var_initial_total + var_repeat_total
+    mu_repeat_total = mu_repeat_one_round * repeat_rounds
+    var_repeat_total = var_repeat_one_round * repeat_rounds
 
-    initial_dice_text = f"{initial['dice']}d{initial['sides']}" if initial["dice"] > 0 and initial["sides"] > 0 else "0"
-    repeat_dice_text = f"{repeat['dice']}d{repeat['sides']}" if repeat["dice"] > 0 and repeat["sides"] > 0 else "0"
+    mu_full = mu_initial + mu_repeat_total
+    var_full = var_initial + var_repeat_total
 
-    table_data.append({
+    damage_types = sorted({
+        row["Damage Type"]
+        for row in breakdown_initial + breakdown_repeat
+        if row["Damage Type"] != "none"
+    })
+    damage_type_text = ", ".join(damage_types) if damage_types else "none"
+
+    summary_rows.append({
         "Spell": entry["name"],
-        "Slot Level": entry["slot"],
-        "Initial Dice": initial_dice_text,
-        "Initial Rays": int(initial["rays"]),
-        "Initial Targets": int(init_targets),
-        "Initial Resolution": init_resolution,
-        "Repeat Dice": repeat_dice_text,
-        "Repeat Rays": int(repeat["rays"]),
-        "Repeat Targets": int(repeat_targets),
-        "Repeat Resolution": repeat_resolution,
-        "Repeat Rounds": int(repeat_rounds),
-        "Initial Expected Damage": round(mu_initial_total, 2),
-        "Repeat Expected Damage": round(mu_repeat_total, 2),
-        "Full Spell Expected Damage": round(mu_full_spell, 2),
+        "Slot Level": slot,
+        "Damage Types": damage_type_text,
+        "Initial Expected Damage": round(mu_initial, 2),
+        "Repeat / Round": round(mu_repeat_one_round, 2),
+        "Repeat Rounds": repeat_rounds,
+        "Full Spell Expected Damage": round(mu_full, 2),
+        "Max Rounds": int(spell["max_rounds"]),
+        "Notes": spell["notes"],
     })
 
 ax_initial.set_xlabel("Damage")
@@ -569,65 +558,104 @@ fig_full, ax_full = plt.subplots()
 
 for entry in spell_entries:
     spell = spell_db[spell_db["name"] == entry["name"]].iloc[0]
+    slot = int(entry["slot"])
 
-    initial = calculate_scaled_component(spell, entry["slot"], prefix="")
-    init_targets = apply_target_override(initial["targets"], default_aoe_targets)
+    initial_packets = get_spell_packets(spell, slot, "initial")
+    repeat_packets = get_spell_packets(spell, slot, "repeat")
 
-    mu_single_init, var_single_init, _ = component_stats(
-        component=initial,
+    mu_initial, var_initial, _ = aggregate_packet_group_stats(
+        packet_list=initial_packets,
         DC=DC,
         monster_saves=monster_saves,
-        attack_bonus=spell_attack_bonus,
+        spell_attack_bonus=spell_attack_bonus,
         target_ac=target_ac,
-        roll_mode=attack_roll_mode
+        attack_roll_mode=attack_roll_mode,
+        aoe_override=default_aoe_targets
     )
 
-    init_instances = int(initial["rays"]) * int(init_targets)
-    mu_initial_total = mu_single_init * init_instances
-    var_initial_total = var_single_init * init_instances
-
-    repeat = calculate_scaled_component(spell, entry["slot"], prefix="repeat_")
-    repeat_targets = apply_target_override(repeat["targets"], default_aoe_targets)
-
-    mu_single_repeat, var_single_repeat, _ = component_stats(
-        component=repeat,
+    mu_repeat_one_round, var_repeat_one_round, _ = aggregate_packet_group_stats(
+        packet_list=repeat_packets,
         DC=DC,
         monster_saves=monster_saves,
-        attack_bonus=spell_attack_bonus,
+        spell_attack_bonus=spell_attack_bonus,
         target_ac=target_ac,
-        roll_mode=attack_roll_mode
+        attack_roll_mode=attack_roll_mode,
+        aoe_override=default_aoe_targets
     )
 
-    repeat_instances_per_round = int(repeat["rays"]) * int(repeat_targets)
     active_rounds = min(int(combat_rounds), int(spell["max_rounds"]))
     repeat_rounds = max(active_rounds - 1, 0)
 
-    mu_repeat_total = mu_single_repeat * repeat_instances_per_round * repeat_rounds
-    var_repeat_total = var_single_repeat * repeat_instances_per_round * repeat_rounds
-
-    mu_full = mu_initial_total + mu_repeat_total
-    var_full = var_initial_total + var_repeat_total
+    mu_full = mu_initial + mu_repeat_one_round * repeat_rounds
+    var_full = var_initial + var_repeat_one_round * repeat_rounds
 
     x_full, pdf_full = make_distribution(mu_full, var_full)
 
     ax_full.plot(
         x_full,
         pdf_full,
-        label=f"{entry['name']} (Lv {entry['slot']})"
+        label=f"{entry['name']} (Lv {slot})"
     )
 
 ax_full.set_xlabel("Total Spell Damage")
 ax_full.set_ylabel("Probability Density")
-ax_full.set_title("Full Spell Damage Distribution Across Rays, Targets, and Rounds")
+ax_full.set_title("Full Spell Damage Distribution")
 ax_full.legend(fontsize=8)
 
 st.pyplot(fig_full)
 
 #############################################
-# RESULTS TABLE
+# SUMMARY TABLE
 #############################################
 
-df = pd.DataFrame(table_data)
-
 st.header("Expected Damage Table")
-st.dataframe(df)
+summary_df = pd.DataFrame(summary_rows)
+st.dataframe(summary_df, use_container_width=True)
+
+#############################################
+# OPTIONAL BREAKDOWN TABLES
+#############################################
+
+st.header("Per-Spell Packet Breakdown")
+
+for entry in spell_entries:
+    spell = spell_db[spell_db["name"] == entry["name"]].iloc[0]
+    slot = int(entry["slot"])
+
+    initial_packets = get_spell_packets(spell, slot, "initial")
+    repeat_packets = get_spell_packets(spell, slot, "repeat")
+
+    _, _, breakdown_initial = aggregate_packet_group_stats(
+        packet_list=initial_packets,
+        DC=DC,
+        monster_saves=monster_saves,
+        spell_attack_bonus=spell_attack_bonus,
+        target_ac=target_ac,
+        attack_roll_mode=attack_roll_mode,
+        aoe_override=default_aoe_targets
+    )
+
+    _, _, breakdown_repeat = aggregate_packet_group_stats(
+        packet_list=repeat_packets,
+        DC=DC,
+        monster_saves=monster_saves,
+        spell_attack_bonus=spell_attack_bonus,
+        target_ac=target_ac,
+        attack_roll_mode=attack_roll_mode,
+        aoe_override=default_aoe_targets
+    )
+
+    with st.expander(f"{entry['name']} (Lv {slot}) breakdown", expanded=False):
+        st.write(f"**Notes:** {spell['notes'] if spell['notes'] else 'None'}")
+
+        st.write("**Initial packets**")
+        if breakdown_initial:
+            st.dataframe(pd.DataFrame(breakdown_initial), use_container_width=True)
+        else:
+            st.write("No initial damage packets.")
+
+        st.write("**Repeat packets**")
+        if breakdown_repeat:
+            st.dataframe(pd.DataFrame(breakdown_repeat), use_container_width=True)
+        else:
+            st.write("No repeat damage packets.")
